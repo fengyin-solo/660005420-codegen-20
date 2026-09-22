@@ -8,6 +8,44 @@ from pydantic import BaseModel
 app = FastAPI(title="Log Anomaly Detector")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+# 聚合窗口：每个窗口代表 WINDOW_SECONDS 秒，作为生成速率的统计基准
+WINDOW_SIZE = 20
+WINDOW_SECONDS = 60
+
+# 各类日志的解析规则（正则/Grok 风格命名分组），None 表示结构化 JSON 直接视为可解析
+PARSE_PATTERNS = {
+    "nginx": re.compile(r'(?P<timestamp>\S+ \+\d{4}) (?P<source>\S+) (?P<level>\w+) (?P<message>.+)'),
+    "apache": re.compile(r'\[(?P<timestamp>[^\]]+)\] \[(?P<level>\w+)\] \[(?P<source>\S+)\] (?P<message>.+)'),
+    "custom": re.compile(r'(?P<timestamp>\d+) (?P<source>\S+) (?P<level>\w+) (?P<message>.+)'),
+    "json_app": None,
+}
+# 通用兜底解析器：所有日志生成时均为 [timestamp] [level] [source] message 形式
+FALLBACK_PATTERN = re.compile(r'^\[(?P<timestamp>[^\]]+)\] \[(?P<level>[^\]]+)\] \[(?P<source>[^\]]+)\] (?P<message>.+)$')
+
+
+def build_raw(log_type, entry):
+    """按日志类型构造该类型的原生行格式（可被对应解析器解析）。"""
+    if log_type == "nginx":
+        return f"{entry['timestamp']} {entry['source']} {entry['level']} {entry['message']}"
+    if log_type == "custom":
+        return f"{entry['timestamp']} {entry['source']} {entry['level']} {entry['message']}"
+    return f"[{entry['timestamp']}] [{entry['level']}] [{entry['source']}] {entry['message']}"
+
+
+def parse_raw(log_type, raw):
+    """模拟日志解析引擎：优先用该类型的规则解析，再尝试通用兜底。返回 (是否解析成功, 字段dict)。"""
+    pattern = PARSE_PATTERNS.get(log_type)
+    if pattern is None:
+        # 结构化 JSON 日志：字段已随结构上报，天然可解析
+        return True, {}
+    m = pattern.match(raw or "")
+    if m:
+        return True, m.groupdict()
+    m = FALLBACK_PATTERN.match(raw or "")
+    if m:
+        return True, m.groupdict()
+    return False, {}
+
 LOG_TEMPLATES = {
     "nginx": {
         "pattern": r'(?P<timestamp>\S+ \+\d{4}) (?P<source>\S+) (?P<level>\w+) (?P<message>.+)',
@@ -73,6 +111,7 @@ class DetectRequest(BaseModel):
     logs: list
     rules: list = []
     query: str = ""
+    type: str = "nginx"
 
 
 @app.post("/api/generate")
@@ -87,32 +126,39 @@ def generate_logs(req: GenerateRequest):
             "level": entry["level"],
             "source": entry["source"],
             "message": entry["message"],
-            "raw": f"[{entry['timestamp']}] [{entry['level']}] [{entry['source']}] {entry['message']}"
+            "raw": build_raw(req.type, entry)
         })
-    return analyze_logs(logs, [], "")
+    return analyze_logs(logs, [], "", req.type)
 
 
 @app.post("/api/detect")
 def detect_anomalies(req: DetectRequest):
-    return analyze_logs(req.logs, req.rules, req.query)
+    return analyze_logs(req.logs, req.rules, req.query, req.type)
 
 
-def analyze_logs(logs_data, rules, query):
+def analyze_logs(logs_data, rules, query, log_type="nginx"):
     logs = logs_data
     n = len(logs)
 
-    # Time windows (1min each for demonstration)
-    window_size = 20
+    # Time windows (WINDOW_SECONDS seconds each for demonstration)
     windows = []
-    for i in range(0, n, window_size):
-        chunk = logs[i:i + window_size]
-        levels = Counter(l["level"] for l in chunk)
-        sources = Counter(l["source"] for l in chunk)
+    for i in range(0, n, WINDOW_SIZE):
+        chunk = logs[i:i + WINDOW_SIZE]
+        levels = Counter(l.get("level", "") for l in chunk)
+        sources = Counter(l.get("source", "") for l in chunk)
+        parsed = 0
+        for l in chunk:
+            ok, _ = parse_raw(log_type, l.get("raw", ""))
+            if ok:
+                parsed += 1
         windows.append({
-            "start": i, "end": min(i + window_size, n),
+            "start": i, "end": min(i + WINDOW_SIZE, n),
             "count": len(chunk),
             "levels": dict(levels),
-            "sources": dict(sources)
+            "sources": dict(sources),
+            "parsed": parsed,
+            "startTs": chunk[0].get("timestamp", "") if chunk else "",
+            "endTs": chunk[-1].get("timestamp", "") if chunk else ""
         })
 
     # 3-sigma + IQR anomaly detection
@@ -136,7 +182,7 @@ def analyze_logs(logs_data, rules, query):
             "sigmaScore": round(sigma_score, 2),
             "iqrScore": round(iqr_score, 2),
             "isAnomaly": sigma_score > 2.5 or iqr_score > 3.0,
-            "timestamp": logs[i * window_size]["timestamp"] if i * window_size < len(logs) else ""
+            "timestamp": logs[i * WINDOW_SIZE].get("timestamp", "") if i * WINDOW_SIZE < len(logs) else ""
         })
 
     # Alert rules
@@ -183,5 +229,8 @@ def analyze_logs(logs_data, rules, query):
         "windows": windows,
         "anomalies": anomalies,
         "alerts": alerts[:20],
-        "totalLogs": n
+        "totalLogs": n,
+        "logType": log_type,
+        "windowSize": WINDOW_SIZE,
+        "windowSeconds": WINDOW_SECONDS
     }
