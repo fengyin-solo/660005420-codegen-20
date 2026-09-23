@@ -1,4 +1,4 @@
-import re, math, time, random
+import re, json, math, time, random
 import numpy as np
 from collections import defaultdict, Counter
 from fastapi import FastAPI
@@ -11,6 +11,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 LOG_TEMPLATES = {
     "nginx": {
         "pattern": r'(?P<timestamp>\S+ \+\d{4}) (?P<source>\S+) (?P<level>\w+) (?P<message>.+)',
+        "sources": ["nginx", "api-gateway", "load-balancer"],
         "generator": lambda: {
             "timestamp": f"{random.randint(1,28):02d}/{'Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec'.split()[random.randint(0,11)]}/{2024}:{random.randint(0,23):02d}:{random.randint(0,59):02d}:{random.randint(0,59):02d} +0000",
             "source": random.choice(["nginx", "api-gateway", "load-balancer"]),
@@ -25,6 +26,7 @@ LOG_TEMPLATES = {
     },
     "apache": {
         "pattern": r'\[(?P<timestamp>[^\]]+)\] \[(?P<level>\w+)\] \[(?P<source>\S+)\] (?P<message>.+)',
+        "sources": ["httpd", "mod_ssl", "mod_rewrite"],
         "generator": lambda: {
             "timestamp": f"{'Sun Mon Tue Wed Thu Fri Sat'.split()[random.randint(0,6)]} {'Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec'.split()[random.randint(0,11)]} {random.randint(1,28):02d} {random.randint(0,23):02d}:{random.randint(0,59):02d}:{random.randint(0,59):02d} {2024}",
             "source": random.choice(["httpd", "mod_ssl", "mod_rewrite"]),
@@ -35,6 +37,7 @@ LOG_TEMPLATES = {
     },
     "json_app": {
         "pattern": None,
+        "sources": ["user-service", "order-service", "payment-service", "auth-service"],
         "generator": lambda: {
             "timestamp": f"{2024}-{random.randint(1,12):02d}-{random.randint(1,28):02d}T{random.randint(0,23):02d}:{random.randint(0,59):02d}:{random.randint(0,59):02d}.{random.randint(0,999):03d}Z",
             "source": random.choice(["user-service", "order-service", "payment-service", "auth-service"]),
@@ -53,6 +56,7 @@ LOG_TEMPLATES = {
     },
     "custom": {
         "pattern": None,
+        "sources": ["cron", "systemd", "kernel", "docker"],
         "generator": lambda: {
             "timestamp": str(int(time.time() - random.randint(0, 86400))),
             "source": random.choice(["cron", "systemd", "kernel", "docker"]),
@@ -62,6 +66,57 @@ LOG_TEMPLATES = {
         }
     }
 }
+
+# 每种日志类型可能上报的全部来源（用于计算在线率）
+SOURCE_ROSTER = {
+    "nginx": ["nginx", "api-gateway", "load-balancer"],
+    "apache": ["httpd", "mod_ssl", "mod_rewrite"],
+    "json_app": ["user-service", "order-service", "payment-service", "auth-service"],
+    "custom": ["cron", "systemd", "kernel", "docker"],
+}
+
+
+def build_raw(log_type, e):
+    """按日志类型生成对应的原始报文，保证与解析器正则一致。"""
+    if log_type == "nginx":
+        return f"{e['timestamp']} {e['source']} {e['level']} {e['message']}"
+    if log_type == "json_app":
+        return json.dumps({
+            "ts": e["timestamp"], "level": e["level"],
+            "source": e["source"], "msg": e["message"]
+        }, ensure_ascii=False)
+    if log_type == "custom":
+        return f"{e['timestamp']} {e['level']} {e['source']} {e['message']}"
+    # apache 统一的 [时间] [级别] [来源] 消息 报文
+    return f"[{e['timestamp']}] [{e['level']}] [{e['source']}] {e['message']}"
+
+
+CORRUPT_PREFIX = "##MALFORMED## "
+
+
+def make_corrupt(raw):
+    """模拟采集/传输异常导致的残缺报文：截断并加上乱码前缀，使其无法被解析。"""
+    cut = max(8, int(len(raw) * random.uniform(0.4, 0.7)))
+    return CORRUPT_PREFIX + raw[:cut]
+
+
+def parse_raw(log_type, raw):
+    """按类型解析原始报文，解析成功返回 True。统计“解析成功率”时与页面口径一致。"""
+    if isinstance(raw, dict):
+        return True
+    if not isinstance(raw, str) or raw.startswith(CORRUPT_PREFIX):
+        return False
+    pattern = LOG_TEMPLATES.get(log_type, LOG_TEMPLATES["nginx"]).get("pattern")
+    if pattern is None:
+        if log_type == "json_app":
+            try:
+                obj = json.loads(raw)
+                return isinstance(obj, dict) and all(k in obj for k in ("ts", "level", "source", "msg"))
+            except (ValueError, TypeError):
+                return False
+        # custom: <unix秒> <级别> <来源> <消息>
+        return bool(re.fullmatch(r"\d{10} \S+ \S+ .+", raw))
+    return re.fullmatch(pattern, raw, re.DOTALL) is not None
 
 
 class GenerateRequest(BaseModel):
@@ -73,6 +128,7 @@ class DetectRequest(BaseModel):
     logs: list
     rules: list = []
     query: str = ""
+    type: str = "nginx"
 
 
 @app.post("/api/generate")
@@ -81,25 +137,37 @@ def generate_logs(req: GenerateRequest):
     logs = []
     for i in range(req.count):
         entry = tmpl["generator"]()
+        raw = build_raw(req.type, entry)
+        # 约 6% 的报文在采集/传输过程中损坏，无法被解析
+        if random.random() < 0.06:
+            raw = make_corrupt(raw)
         logs.append({
             "id": i + 1,
             "timestamp": entry["timestamp"],
             "level": entry["level"],
             "source": entry["source"],
             "message": entry["message"],
-            "raw": f"[{entry['timestamp']}] [{entry['level']}] [{entry['source']}] {entry['message']}"
+            "raw": raw
         })
-    return analyze_logs(logs, [], "")
+    return analyze_logs(logs, [], "", req.type)
 
 
 @app.post("/api/detect")
 def detect_anomalies(req: DetectRequest):
-    return analyze_logs(req.logs, req.rules, req.query)
+    return analyze_logs(req.logs, req.rules, req.query, req.type)
 
 
-def analyze_logs(logs_data, rules, query):
+def analyze_logs(logs_data, rules, query, log_type="nginx"):
     logs = logs_data
     n = len(logs)
+    if n == 0:
+        return {
+            "logs": [], "windows": [], "anomalies": [], "alerts": [],
+            "totalLogs": 0, "totalParsed": 0,
+            "sourceRoster": SOURCE_ROSTER.get(log_type, SOURCE_ROSTER["nginx"]),
+            "logType": log_type
+        }
+    parsed_flags = [parse_raw(log_type, l.get("raw")) for l in logs]
 
     # Time windows (1min each for demonstration)
     window_size = 20
@@ -108,11 +176,15 @@ def analyze_logs(logs_data, rules, query):
         chunk = logs[i:i + window_size]
         levels = Counter(l["level"] for l in chunk)
         sources = Counter(l["source"] for l in chunk)
+        parsed = sum(1 for j in range(i, min(i + window_size, n)) if parsed_flags[j])
         windows.append({
             "start": i, "end": min(i + window_size, n),
             "count": len(chunk),
+            "parsed": parsed,
             "levels": dict(levels),
-            "sources": dict(sources)
+            "sources": dict(sources),
+            "firstTimestamp": chunk[0].get("timestamp", "") if chunk else "",
+            "lastTimestamp": chunk[-1].get("timestamp", "") if chunk else ""
         })
 
     # 3-sigma + IQR anomaly detection
@@ -183,5 +255,8 @@ def analyze_logs(logs_data, rules, query):
         "windows": windows,
         "anomalies": anomalies,
         "alerts": alerts[:20],
-        "totalLogs": n
+        "totalLogs": n,
+        "totalParsed": sum(parsed_flags),
+        "sourceRoster": SOURCE_ROSTER.get(log_type, SOURCE_ROSTER["nginx"]),
+        "logType": log_type
     }

@@ -22,7 +22,7 @@ export const useLogStore = defineStore('log', () => {
   async function detect() {
     if (!result.value) return
     loading.value=true
-    try { const {data} = await axios.post('/api/detect',{logs:result.value.logs,rules:rules.value.filter(r=>r.enabled),query:searchQuery.value}) ; result.value=data }
+    try { const {data} = await axios.post('/api/detect',{logs:result.value.logs,rules:rules.value.filter(r=>r.enabled),query:searchQuery.value,type:result.value.logType||logType.value}) ; result.value=data }
     finally { loading.value=false }
   }
 

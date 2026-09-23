@@ -24,6 +24,9 @@
       <TrendChart />
       <HeatmapChart />
     </div>
+    <div class="health-row">
+      <HealthPanel />
+    </div>
   </div>
 </template>
 
@@ -33,6 +36,7 @@ import AnomalyChart from './components/AnomalyChart.vue'
 import AlertPanel from './components/AlertPanel.vue'
 import TrendChart from './components/TrendChart.vue'
 import HeatmapChart from './components/HeatmapChart.vue'
+import HealthPanel from './components/HealthPanel.vue'
 import { useLogStore } from './store/log'
 const store = useLogStore()
 </script>
@@ -47,4 +51,5 @@ body{font-family:system-ui,monospace;background:#0f172a;color:#e2e8f0}
 .main-grid{display:grid;grid-template-columns:1fr 400px;gap:12px;padding:12px 20px;min-height:50vh}
 .grid-col{overflow:hidden}
 .bottom-row{display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:0 20px 16px}
+.health-row{padding:0 20px 16px}
 </style>
